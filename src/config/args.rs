@@ -1,9 +1,12 @@
 //! Default argument processing when `ui_test` is used
 //! as a test driver.
 
+use std::time::Duration;
 use std::{borrow::Cow, num::NonZeroUsize};
 
 use color_eyre::eyre::{bail, ensure, Result};
+
+use crate::DEFAULT_TEST_TIMEOUT;
 
 /// Plain arguments if `ui_test` is used as a binary.
 #[derive(Debug, Default)]
@@ -36,6 +39,9 @@ pub struct Args {
 
     /// Skip tests whose names contain any of these entries.
     pub skip: Vec<String>,
+
+    /// Timeout after which tests are considered to have failed. Defaults to 60 seconds.
+    pub timeout: Duration,
 }
 
 /// Possible choices for styling the output.
@@ -50,9 +56,14 @@ pub enum Format {
 
 impl Args {
     /// Parse the program arguments.
-    /// This is meant to be used if `ui_test` is used as a `harness=false` test, called from `cargo test`.
+    /// This is meant to be used if `ui_test` is used as a `harness=false` test, called from
+    /// `cargo test`.
     pub fn test() -> Result<Self> {
-        Self::default().parse_args(std::env::args().skip(1))
+        Self {
+            timeout: DEFAULT_TEST_TIMEOUT,
+            ..Default::default()
+        }
+        .parse_args(std::env::args().skip(1))
     }
 
     /// Parse arguments into an existing `Args` struct.
@@ -87,6 +98,8 @@ impl Args {
                 bail!("available flags: --quiet, --check, --bless, --test-threads=n, --skip")
             } else if let Some(n) = parse_value("--test-threads", &arg, &mut iter)? {
                 self.threads = Some(n.parse()?);
+            } else if let Some(timeout) = parse_value("--test-timeout", &arg, &mut iter)? {
+                self.timeout = Duration::from_secs(timeout.parse()?);
             } else if arg.starts_with("--") {
                 bail!(
                     "unknown command line flag `{arg}`: {:?}",

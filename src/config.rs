@@ -1,12 +1,14 @@
 use regex::bytes::Regex;
 use spanned::{Span, Spanned};
 
+use crate::DEFAULT_TEST_TIMEOUT;
 use crate::{
     dependencies::build_dependencies, per_test_config::Comments, CommandBuilder, Match, Mode,
     RustfixMode,
 };
 pub use color_eyre;
 use color_eyre::eyre::Result;
+use std::time::Duration;
 use std::{
     ffi::OsString,
     num::NonZeroUsize,
@@ -53,6 +55,8 @@ pub struct Config {
     pub filter_exact: bool,
     /// The default settings settable via `@` comments
     pub comment_defaults: Comments,
+    /// The timeout after which tests are considered to have failed.
+    pub timeout: Duration,
 }
 
 impl Config {
@@ -98,6 +102,7 @@ impl Config {
             run_only_ignored: false,
             filter_exact: false,
             comment_defaults,
+            timeout: DEFAULT_TEST_TIMEOUT,
         }
     }
 
@@ -129,6 +134,7 @@ impl Config {
             format: _,
             threads,
             ref skip,
+            timeout,
         } = *args;
 
         self.threads = threads.or(self.threads);
@@ -145,6 +151,8 @@ impl Config {
         } else if bless {
             self.output_conflict_handling = OutputConflictHandling::Bless;
         }
+
+        self.timeout = timeout;
     }
 
     /// Replace all occurrences of a path in stderr/stdout with a byte string.

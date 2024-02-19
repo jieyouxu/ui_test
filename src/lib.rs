@@ -11,8 +11,8 @@
 use bstr::ByteSlice;
 pub use color_eyre;
 use color_eyre::eyre::{eyre, Result};
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use dependencies::{Build, BuildManager};
+use futures::FutureExt;
 use lazy_static::lazy_static;
 use parser::{ErrorMatch, ErrorMatchKind, OptWithLine, Revisioned, Spanned};
 use regex::bytes::{Captures, Regex};
@@ -25,7 +25,7 @@ use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, ExitStatus, Output};
-use std::thread;
+use std::time::Duration;
 
 use crate::parser::{Comments, Condition};
 
@@ -50,6 +50,9 @@ pub use mode::*;
 
 pub use spanned;
 
+/// Default test timeout (in seconds).
+const DEFAULT_TEST_TIMEOUT: Duration = Duration::from_secs(0);
+
 /// A filter's match rule.
 #[derive(Clone, Debug)]
 pub enum Match {
@@ -60,6 +63,7 @@ pub enum Match {
     /// Uses a heuristic to find backslashes in windows style paths
     PathBackslash,
 }
+
 impl Match {
     fn replace_all<'a>(&self, text: &'a [u8], replacement: &[u8]) -> Cow<'a, [u8]> {
         match self {
@@ -265,8 +269,6 @@ pub fn run_tests_generic(
 
     let build_manager = BuildManager::new(&status_emitter);
 
-    let mut results = vec![];
-
     let num_threads = match configs.first().and_then(|config| config.threads) {
         Some(threads) => threads,
         None => match std::env::var_os("RUST_TEST_THREADS") {
@@ -278,89 +280,21 @@ pub fn run_tests_generic(
         },
     };
 
-    let mut filtered = 0;
-    run_and_collect(
-        num_threads,
-        |submit| {
-            let mut todo = VecDeque::new();
-            for config in &configs {
-                todo.push_back((config.root_dir.clone(), config));
-            }
-            while let Some((path, config)) = todo.pop_front() {
-                if path.is_dir() {
-                    if path.file_name().unwrap() == "auxiliary" {
-                        continue;
-                    }
-                    // Enqueue everything inside this directory.
-                    // We want it sorted, to have some control over scheduling of slow tests.
-                    let mut entries = std::fs::read_dir(path)
-                        .unwrap()
-                        .map(|e| e.unwrap().path())
-                        .collect::<Vec<_>>();
-                    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-                    for entry in entries {
-                        todo.push_back((entry, config));
-                    }
-                } else if let Some(matched) = file_filter(&path, config) {
-                    if matched {
-                        let status = status_emitter.register_test(path);
-                        // Forward .rs files to the test workers.
-                        submit.send((status, config)).unwrap();
-                    } else {
-                        filtered += 1;
-                    }
-                }
-            }
-        },
-        |receive, finished_files_sender| -> Result<()> {
-            for (status, config) in receive {
-                let path = status.path();
-                let file_contents = std::fs::read(path).unwrap();
-                let mut config = config.clone();
-                per_file_config(&mut config, path, &file_contents);
-                let result = match std::panic::catch_unwind(|| {
-                    parse_and_test_file(&build_manager, &status, config, file_contents)
-                }) {
-                    Ok(Ok(res)) => res,
-                    Ok(Err(err)) => {
-                        finished_files_sender.send(TestRun {
-                            result: Err(err),
-                            status,
-                        })?;
-                        continue;
-                    }
-                    Err(err) => {
-                        finished_files_sender.send(TestRun {
-                            result: Err(Errored {
-                                command: Command::new("<unknown>"),
-                                errors: vec![Error::Bug(
-                                    *Box::<dyn std::any::Any + Send + 'static>::downcast::<String>(
-                                        err,
-                                    )
-                                    .unwrap(),
-                                )],
-                                stderr: vec![],
-                                stdout: vec![],
-                            }),
-                            status,
-                        })?;
-                        continue;
-                    }
-                };
-                for result in result {
-                    finished_files_sender.send(result)?;
-                }
-            }
-            Ok(())
-        },
-        |finished_files_recv| {
-            for run in finished_files_recv {
-                run.status.done(&run.result);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .worker_threads(num_threads.get())
+        .build()?;
 
-                results.push(run);
-            }
-        },
-    )?;
+    let (results, filtered) = rt.block_on(async {
+        run_and_collect(
+            &build_manager,
+            &configs,
+            file_filter,
+            per_file_config,
+            &status_emitter,
+        )
+        .await
+    })?;
 
     let mut failures = vec![];
     let mut succeeded = 0;
@@ -396,44 +330,154 @@ pub fn run_tests_generic(
     }
 }
 
-/// A generic multithreaded runner that has a thread for producing work,
-/// a thread for collecting work, and `num_threads` threads for doing the work.
-pub fn run_and_collect<SUBMISSION: Send, RESULT: Send>(
-    num_threads: NonZeroUsize,
-    submitter: impl FnOnce(Sender<SUBMISSION>) + Send,
-    runner: impl Sync + Fn(&Receiver<SUBMISSION>, Sender<RESULT>) -> Result<()>,
-    collector: impl FnOnce(Receiver<RESULT>) + Send,
-) -> Result<()> {
-    // A channel for files to process
-    let (submit, receive) = unbounded();
+async fn run_and_collect(
+    build_manager: &BuildManager<'_>,
+    configs: &[Config],
+    file_filter: impl Fn(&Path, &Config) -> Option<bool> + Sync,
+    per_file_config: impl Fn(&mut Config, &Path, &[u8]) + Sync,
+    status_emitter: &(impl StatusEmitter + Send),
+) -> Result<(Vec<TestRun>, usize)> {
+    let (submitter, receive) = async_channel::unbounded();
+    let (finished_files_sender, finished_files_recv) = tokio::sync::mpsc::unbounded_channel();
 
-    thread::scope(|s| {
-        // Create a thread that is in charge of walking the directory and submitting jobs.
-        // It closes the channel when it is done.
-        s.spawn(|| submitter(submit));
+    let gen_tests_fut = generate_tests(&configs, file_filter, status_emitter, submitter);
+    let run_test_fut = runner(
+        build_manager,
+        per_file_config,
+        receive,
+        finished_files_sender,
+    );
+    let collect_fut = collector(finished_files_recv);
 
-        // A channel for the messages emitted by the individual test threads.
-        // Used to produce live updates while running the tests.
-        let (finished_files_sender, finished_files_recv) = unbounded();
+    let (gen_tests_result, run_test_result, test_results) =
+        tokio::join!(gen_tests_fut, run_test_fut, collect_fut);
 
-        s.spawn(|| collector(finished_files_recv));
-
-        let mut threads = vec![];
-
-        // Create N worker threads that receive files to test.
-        for _ in 0..num_threads.get() {
-            let finished_files_sender = finished_files_sender.clone();
-            threads.push(s.spawn(|| runner(&receive, finished_files_sender)));
-        }
-
-        for thread in threads {
-            thread.join().unwrap()?;
-        }
-        Ok(())
-    })
+    let filtered = gen_tests_result?;
+    run_test_result?;
+    Ok((test_results, filtered))
 }
 
-fn parse_and_test_file(
+async fn generate_tests(
+    configs: &[Config],
+    file_filter: impl Fn(&Path, &Config) -> Option<bool> + Sync,
+    status_emitter: &(impl StatusEmitter + Send),
+    submitter: async_channel::Sender<(Box<dyn TestStatus>, Config)>,
+) -> Result<usize> {
+    let mut filtered = 0;
+
+    let mut todo = VecDeque::new();
+    for config in configs {
+        todo.push_back((config.root_dir.clone(), config));
+    }
+
+    while let Some((path, config)) = todo.pop_front() {
+        if path.is_dir() {
+            if path.file_name().unwrap() == "auxiliary" {
+                continue;
+            }
+            // Enqueue everything inside this directory.
+            // We want it sorted, to have some control over scheduling of slow tests.
+            let mut entries = Vec::new();
+            let mut read_dir = tokio::fs::read_dir(path).await?;
+            while let Some(entry) = read_dir.next_entry().await? {
+                entries.push(entry.path());
+            }
+            entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+            for entry in entries {
+                todo.push_back((entry, config));
+            }
+        } else if let Some(matched) = file_filter(&path, config) {
+            if matched {
+                let status = status_emitter.register_test(path);
+                // Forward .rs files to the test workers.
+                submitter.send((status, config.clone())).await?;
+            } else {
+                filtered += 1;
+            }
+        }
+    }
+
+    Ok(filtered)
+}
+
+async fn runner(
+    build_manager: &BuildManager<'_>,
+    per_file_config: impl Fn(&mut Config, &Path, &[u8]) + Sync,
+    receive: async_channel::Receiver<(Box<dyn TestStatus>, Config)>,
+    finished_files_sender: tokio::sync::mpsc::UnboundedSender<TestRun>,
+) -> Result<()> {
+    while let Ok((status, config)) = receive.recv().await {
+        let path = status.path();
+        let file_contents = std::fs::read(path).unwrap();
+        let mut config = config.clone();
+        per_file_config(&mut config, path, &file_contents);
+
+        let Ok(result) = tokio::time::timeout(
+            config.timeout,
+            parse_and_test_file(build_manager, &status, config.clone(), file_contents)
+                .catch_unwind(),
+        )
+        .await
+        else {
+            finished_files_sender.send(TestRun {
+                result: Err(Errored {
+                    command: Command::new("<unknown>"),
+                    errors: vec![Error::Bug(format!(
+                        "test `{}` timed out after {} second(s)",
+                        path.display(),
+                        config.timeout.as_secs()
+                    ))],
+                    stderr: vec![],
+                    stdout: vec![],
+                }),
+                status,
+            })?;
+            continue;
+        };
+
+        let result = match result {
+            Ok(Ok(res)) => res,
+            Ok(Err(err)) => {
+                finished_files_sender.send(TestRun {
+                    result: Err(err),
+                    status,
+                })?;
+                continue;
+            }
+            Err(err) => {
+                finished_files_sender.send(TestRun {
+                    result: Err(Errored {
+                        command: Command::new("<unknown>"),
+                        errors: vec![Error::Bug(
+                            *Box::<dyn std::any::Any + Send + 'static>::downcast::<String>(err)
+                                .unwrap(),
+                        )],
+                        stderr: vec![],
+                        stdout: vec![],
+                    }),
+                    status,
+                })?;
+                continue;
+            }
+        };
+        for result in result {
+            finished_files_sender.send(result)?;
+        }
+    }
+    Ok(())
+}
+
+async fn collector(
+    mut finished_files_recv: tokio::sync::mpsc::UnboundedReceiver<TestRun>,
+) -> Vec<TestRun> {
+    let mut results = Vec::new();
+    while let Some(res) = finished_files_recv.recv().await {
+        results.push(res);
+    }
+    results
+}
+
+async fn parse_and_test_file(
     build_manager: &BuildManager<'_>,
     status: &dyn TestStatus,
     mut config: Config,
@@ -444,41 +488,49 @@ fn parse_and_test_file(
         config.comment_defaults.clone(),
         status.path(),
     )?;
+
     const EMPTY: &[String] = &[String::new()];
     // Run the test for all revisions
     let revisions = comments.revisions.as_deref().unwrap_or(EMPTY);
     let mut built_deps = false;
-    Ok(revisions
-        .iter()
-        .map(|revision| {
-            let status = status.for_revision(revision);
-            // Ignore file if only/ignore rules do (not) apply
-            if !status.test_file_conditions(&comments, &config) {
-                return TestRun {
-                    result: Ok(TestOk::Ignored),
-                    status,
-                };
-            }
 
-            if !built_deps {
-                status.update_status("waiting for dependencies to finish building".into());
-                match build_manager.build(Build::Dependencies, &config) {
-                    Ok(extra_args) => config.program.args.extend(extra_args),
-                    Err(err) => {
-                        return TestRun {
-                            result: Err(err),
-                            status,
-                        }
-                    }
+    let mut ret = Vec::new();
+
+    for revision in revisions {
+        let status = status.for_revision(revision);
+        // Ignore file if only/ignore rules do (not) apply
+        if !status.test_file_conditions(&comments, &config) {
+            ret.push(TestRun {
+                result: Ok(TestOk::Ignored),
+                status,
+            });
+            continue;
+        }
+
+        if !built_deps {
+            status.update_status("waiting for dependencies to finish building".into());
+            let config_clone = config.clone();
+            match tokio::task::block_in_place(move || {
+                build_manager.build(Build::Dependencies, &config_clone)
+            }) {
+                Ok(extra_args) => config.program.args.extend(extra_args),
+                Err(err) => {
+                    ret.push(TestRun {
+                        result: Err(err),
+                        status,
+                    });
+                    continue;
                 }
-                status.update_status(String::new());
-                built_deps = true;
             }
+            status.update_status(String::new());
+            built_deps = true;
+        }
 
-            let result = status.run_test(build_manager, &config, &comments);
-            TestRun { result, status }
-        })
-        .collect())
+        let result = status.run_test(&build_manager, &config, &comments);
+        ret.push(TestRun { result, status })
+    }
+
+    Ok(ret)
 }
 
 fn parse_comments(
@@ -934,6 +986,7 @@ fn run_rustfix(
                 no_rustfix: OptWithLine::new((), Span::default()),
                 diagnostic_code_prefix: OptWithLine::new(String::new(), Span::default()),
                 needs_asm_support: false,
+                timeout: DEFAULT_TEST_TIMEOUT,
             },
         ))
         .collect(),

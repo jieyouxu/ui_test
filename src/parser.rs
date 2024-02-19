@@ -1,3 +1,4 @@
+use std::time::Duration;
 use std::{
     collections::HashMap,
     num::NonZeroUsize,
@@ -6,11 +7,11 @@ use std::{
 };
 
 use bstr::{ByteSlice, Utf8Error};
+use color_eyre::eyre::{Context, Result};
 use regex::bytes::Regex;
 
+use crate::DEFAULT_TEST_TIMEOUT;
 use crate::{rustc_stderr::Level, Error, Errored, Match, Mode};
-
-use color_eyre::eyre::{Context, Result};
 
 pub(crate) use spanned::*;
 
@@ -36,7 +37,13 @@ impl Default for Comments {
             revisions: Default::default(),
             revisioned: Default::default(),
         };
-        this.revisioned.insert(vec![], Revisioned::default());
+        this.revisioned.insert(
+            vec![],
+            Revisioned {
+                timeout: DEFAULT_TEST_TIMEOUT,
+                ..Default::default()
+            },
+        );
         this
     }
 }
@@ -167,6 +174,8 @@ pub struct Revisioned {
     /// Prefix added to all diagnostic code matchers. Note this will make it impossible
     /// match codes which do not contain this prefix.
     pub diagnostic_code_prefix: OptWithLine<String>,
+    /// Per-test timeout after which the test is considered to have failed.
+    pub timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -355,6 +364,7 @@ impl Comments {
             needs_asm_support,
             no_rustfix,
             diagnostic_code_prefix,
+            timeout,
         } = parser.comments.base();
         if span.is_dummy() {
             *span = defaults.span;
@@ -385,6 +395,7 @@ impl Comments {
             *diagnostic_code_prefix = defaults.diagnostic_code_prefix;
         }
         *needs_asm_support |= defaults.needs_asm_support;
+        *timeout = defaults.timeout;
 
         if parser.errors.is_empty() {
             Ok(parser.comments)
@@ -711,6 +722,15 @@ impl CommentParser<&mut Revisioned> {
                     prev.is_none(),
                     "cannot specify `require-annotations-for-level` twice",
                 );
+            }
+            "timeout" => (this, args, _span) {
+                let args = args.trim();
+                match args.content.parse() {
+                    Ok(it) => this.timeout = Duration::from_secs(it),
+                    Err(_) => {
+                        this.error(args.span(), "failed to parse `timeout` argument as usize");
+                    }
+                }
             }
         }
         commands
