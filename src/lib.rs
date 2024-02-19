@@ -471,8 +471,9 @@ async fn collector(
     mut finished_files_recv: tokio::sync::mpsc::UnboundedReceiver<TestRun>,
 ) -> Vec<TestRun> {
     let mut results = Vec::new();
-    while let Some(res) = finished_files_recv.recv().await {
-        results.push(res);
+    while let Some(run) = finished_files_recv.recv().await {
+        run.status.done(&run.result);
+        results.push(run);
     }
     results
 }
